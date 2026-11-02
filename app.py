@@ -36,7 +36,6 @@ SAFETY_SOURCE = "official-h5-safety-board"
 DEMO = [{"id": "demo-001", "name": "演示人员甲", "status": "待确认"},
         {"id": "demo-002", "name": "演示人员乙", "status": "待确认"}]
 LOCK = threading.RLock()
-TRIALS = {}
 BATCHES = {}
 BATCH_RUNNING = threading.Event()
 
@@ -88,16 +87,6 @@ def release_submission_claim(path):
         path.unlink()
     except FileNotFoundError:
         pass
-
-
-def trial_allows_batch(business_date):
-    marker = DATA / f"trial-attempt-{business_date}.done"
-    if not marker.exists():
-        return
-    result = read_json(DATA / "trial-result.json", None, strict=True)
-    if (not isinstance(result, dict) or result.get("status") != "success" or
-            str(result.get("at", ""))[:10] != business_date):
-        raise ValueError("今天已有试验但结果不是明确成功，批次已暂停；请人工核对官方记录")
 
 
 def batch_status():
@@ -340,101 +329,6 @@ def verify_school_roster(revision, acknowledged):
         return {"ok": True, "count": len(page["roster"]), "at": snapshot["at"]}
 
 
-def prepare_school_trial(body):
-    """Prepare a reviewable single-record trial; never submit here."""
-    method = body.get("method")
-    explanation = str(body.get("explanation", "")).strip()
-    if method not in {"电话", "当面", "室友转达"} or not explanation or len(explanation) > 100:
-        raise ValueError("请选择真实核实方式，并填写 1–100 字情况说明")
-    with LOCK:
-        page = open_school_roster(now().date().isoformat())
-        if not page.get("roster_ready") or page.get("source") != SAFETY_SOURCE:
-            raise ValueError("必须先读取完整安全待确认名单")
-        if not hmac.compare_digest(str(body.get("revision", "")), page["revision"]):
-            raise ValueError("名单已变化，请重新整体核验")
-        snapshot = read_json(DATA / "school-snapshot.json", None, strict=True)
-        if not isinstance(snapshot, dict) or snapshot.get("date") != page["business_date"] or snapshot.get("source") != SAFETY_SOURCE or snapshot.get("count") != len(page["roster"]) or not hmac.compare_digest(str(snapshot.get("digest", "")), page["revision"]):
-            raise ValueError("请先整体核实并保存今天的完整名单")
-        target = next((row for row in page["roster"] if row["id"] == str(body.get("record_id", ""))), None)
-        if target is None:
-            raise ValueError("试验记录必须在今天已核验的未打卡名单内")
-        token = secrets.token_urlsafe(24)
-        TRIALS.clear()
-        TRIALS[token] = {"record": target, "method": method, "explanation": explanation,
-                         "roster": page["roster"], "revision": page["revision"],
-                         "date": page["business_date"], "expires": monotonic_time.monotonic() + 300}
-        return {"token": token, "record": target, "method": method, "explanation": explanation,
-                "date": page["business_date"], "notice": "仅提交这一条；结果不明或部分成功即停止，不会重试。"}
-
-
-def submit_school_trial(body):
-    """Called only after the user reviews and explicitly approves a trial."""
-    if body.get("supervised_approved") is not True:
-        raise ValueError("请明确确认这是获准的试验记录，并监督一次真实提交")
-    with LOCK:
-        trial = TRIALS.pop(str(body.get("token", "")), None)
-        if not trial or trial["expires"] < monotonic_time.monotonic() or trial["date"] != now().date().isoformat():
-            raise ValueError("试验预览已失效，请重新准备")
-        page = open_school_roster(trial["date"])
-        if not page.get("roster_ready") or not hmac.compare_digest(page.get("revision", ""), trial["revision"]):
-            raise ValueError("名单或状态发生变化，试验已暂停")
-        snapshot = read_json(DATA / "school-snapshot.json", None, strict=True)
-        if (not isinstance(snapshot, dict) or snapshot.get("source") != SAFETY_SOURCE or
-                snapshot.get("date") != trial["date"] or snapshot.get("count") != len(page["roster"]) or
-                not hmac.compare_digest(str(snapshot.get("digest", "")), trial["revision"])):
-            raise ValueError("今日核验快照失效，试验已暂停")
-        if (DATA / f"batch-attempt-{trial['date']}.done").exists():
-            raise ValueError("今天已有批次提交尝试，请人工核对官方结果，不会再次提交试验")
-        claim = submission_claim(trial["date"], "trial")
-        marker = DATA / f"trial-attempt-{trial['date']}.done"
-        try:
-            with marker.open("x", encoding="ascii") as stream:
-                stream.write(now().isoformat(timespec="seconds"))
-        except FileExistsError as exc:
-            release_submission_claim(claim)
-            raise ValueError("今天已经尝试过试验；请先人工核对结果，不会再次提交") from exc
-        from official_adapter import TrialConfig, execute_trial
-        from playwright.sync_api import sync_playwright
-        runtime = None
-        successful = False
-        try:
-            runtime = sync_playwright().start()
-            browser = runtime.chromium.connect_over_cdp(school_bridge().config.endpoint, timeout=15000)
-            candidates = [p for context in browser.contexts for p in context.pages
-                          if urlparse(p.url).hostname == "zhxg.csu.edu.cn" and
-                          urlparse(p.url).fragment.partition("?")[0] == "/ywViews/qxjlfx/dqr/board"]
-            if len(candidates) != 1:
-                raise ValueError("无法唯一定位官方班级看板，试验已停止")
-            result = execute_trial(TrialConfig(page=candidates[0], supervised_approved=True, board_filter="pending"),
-                                   trial["record"], trial["method"], trial["explanation"],
-                                   trial["roster"], trial["date"])
-            minimal = {"at": now().isoformat(timespec="seconds"), "status": result.status,
-                       "submitted": result.submitted, "pending_before": result.pending_before,
-                       "pending_after": result.pending_after, "detail": result.detail}
-            (DATA / "trial-result.json").write_text(json.dumps(minimal, ensure_ascii=False), encoding="utf-8")
-            append_audit("trial_" + result.status, int(result.submitted), result.detail)
-            successful = result.status == "success"
-            return minimal
-        except Exception:
-            unknown = {"at": now().isoformat(timespec="seconds"), "status": "unknown",
-                       "submitted": 0, "pending_before": None, "pending_after": None,
-                       "detail": "试验已停止；请人工核对官方结果，不会自动重试"}
-            try:
-                write_json_atomic(DATA / "trial-result.json", unknown)
-            except OSError:
-                pass
-            append_audit("trial_stopped", 0, "试验已停止；请人工核对官方结果，不会自动重试")
-            raise RuntimeError("试验已停止，请人工核对官方结果；不会自动重试") from None
-        finally:
-            if runtime is not None:
-                try:
-                    runtime.stop()
-                except Exception:
-                    pass
-            if successful:
-                release_submission_claim(claim)
-
-
 def prepare_school_batch(body):
     """Bind a complete set of factual instructions to today's verified roster."""
     supplied = body.get("records")
@@ -497,7 +391,6 @@ def submit_school_batch(body):
                 snapshot.get("date") != batch["date"] or snapshot.get("count") != len(page["roster"]) or
                 not hmac.compare_digest(str(snapshot.get("digest", "")), batch["revision"])):
             raise ValueError("今日核验快照失效，批次已暂停")
-        trial_allows_batch(batch["date"])
         claim = submission_claim(batch["date"], "batch")
         marker = DATA / f"batch-attempt-{batch['date']}.done"
         try:
@@ -709,7 +602,7 @@ HTML = '''<!doctype html>
 <section class="band"><div class="status"><span id="dot" class="dot"></span><strong id="state">正在读取学校页面</strong></div><p class="muted" id="mode">真实学校页面 · 人工核验后提交 · Asia/Shanghai</p><div class="row"><label for="runAt">每日检查时间</label><input id="runAt" class="time" type="time"><button id="saveTime">保存</button><button id="refresh">刷新名单</button><button id="openSchool">打开校园 H5 登录</button><button id="readSchool">刷新学校页面</button><label for="rosterDate">名单日期</label><input id="rosterDate" type="date" disabled><button id="openRoster" class="primary">打开安全待确认名单</button></div><p class="muted">在独立 Edge 中正常登录。学校页面通过直连和移动设备视图访问，登录信息由浏览器保留。</p><p id="schoolStatus" class="muted">学校 H5 尚未读取</p><p id="schoolVerification" class="muted"></p><div class="table-scroll"><table id="schoolTable" hidden><thead><tr><th>人员</th><th>学号</th><th>状态</th><th>核实方式</th><th>情况说明</th></tr></thead><tbody id="schoolRows"></tbody></table></div><p class="row"><label><input id="schoolAck" type="checkbox" disabled> 我已逐人核实以上完整名单中的每个人安全，且确实无法本人打卡</label><button id="verifySchool" disabled>保存今日学校名单核验</button></p><details><summary>查看学校页面可见文字</summary><pre id="schoolText" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto"></pre></details></section>
 <section class="band"><h2>一键提交安全代确认</h2><div class="row"><label>统一核实方式 <select id="batchMethod"><option>电话</option><option>当面</option><option>室友转达</option></select></label><label>统一情况说明 <input id="batchNote" maxlength="100" value="已确认"></label><button id="applyBatch" disabled>应用到全部人员</button></div><p class="muted">默认统一填写“电话 / 已确认”，每行也可修改。检查完整名单及填写内容后生成预览。</p><div class="row"><button id="oneClickSubmit" class="primary" disabled>一键代确认并立即提交</button></div><div class="notice"><span class="lock">点击后将立即提交，无二次确认</span>：先自动保存今日名单核验快照（需已在上方勾选逐人核实），再按上方统一字段（默认“电话 / 已确认”）应用到每一人，生成批次预览并立刻向学校官方页面逐条提交。每个日期最多尝试一次；一旦开始，当天无法再次提交；结果不明或部分成功须人工核对官方记录。若有人核实方式不是电话或情况说明不同，请改用下方分步流程逐人修改后提交。</div><button id="prepareBatch" disabled>生成完整批次预览</button><pre id="batchPreview" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto"></pre><p><label><input id="batchAck" type="checkbox" disabled> 我已检查完整批次，并监督这一次真实提交</label></p><button id="submitBatch" class="primary" disabled>一键提交全部</button><p id="batchResult" class="muted" aria-live="polite"></p></section>
 <section class="band"><h2>全班打卡状态（实时核验）</h2><p class="muted">读取官方看板「全部」视图，实时显示每位学生的当前状态。批次提交完成后会自动刷新；只有名单全部显示「已代确认」才算本批完成。</p><div class="row"><button id="readAllRoster" disabled>读取全班状态</button><span id="allRosterSummary" class="muted"></span></div><div class="table-scroll"><table id="allRosterTable" hidden><thead><tr><th>人员</th><th>学号</th><th>当前状态</th></tr></thead><tbody id="allRosterRows"></tbody></table></div><p id="allRosterResult" class="muted" aria-live="polite"></p></section>
-<section class="band"><h2>监督单条试验</h2><p class="muted">先保存今天完整名单核验，再选择一个获准的试验记录。填写事实后生成预览；只有你明确确认并点击提交，才执行一次真实安全代确认。每日自动提交仍未启用。</p><div class="row"><label>试验人员 <select id="trialRecord" disabled></select></label><label>真实核实方式 <select id="trialMethod"><option value="">请选择</option><option>电话</option><option>当面</option><option>室友转达</option></select></label></div><p><label>情况说明（必填，最多 100 字）<br><textarea id="trialNote" maxlength="100" rows="3" style="width:100%;font:inherit"></textarea></label></p><button id="prepareTrial" disabled>生成单条试验预览</button><pre id="trialPreview" style="white-space:pre-wrap"></pre><p><label><input id="trialAck" type="checkbox" disabled> 此条为获准的试验记录，核实方式和说明真实，我会监督这一次提交</label></p><button id="submitTrial" disabled>提交这一个试验记录</button><p id="trialResult" class="muted"></p></section>
+
 <details><summary style="padding:16px 0">查看本机流程演示（与学校名单无关）</summary><section class="band"><h2>演示待确认名单 <small id="count" class="muted"></small></h2><p id="demoState" class="muted"></p><p class="muted">请核实名单内每一条记录。此处仅测试快照流程。学校实际记录请查看上方连接区域。</p><table><thead><tr><th>人员</th><th>状态</th></tr></thead><tbody id="rows"></tbody></table><p class="row"><label><input id="ack" type="checkbox"> 我已整体核实以上完整名单</label><button id="verify" class="primary" disabled>保存今日核验</button></p></section>
 <section class="band"><h2>执行状态</h2><div class="notice"><span class="lock">提交已锁定</span>：真实 H5 页面结构和提交结果尚未验证。上方连接区域只读取学校页面，此演示区域不会操作学校记录。</div><p id="execution" class="muted"></p></section>
 <section class="band"><h2>最近记录</h2><div id="audit"></div></section></details></main>
@@ -807,14 +700,6 @@ class Handler(BaseHTTPRequestHandler):
                         result = verify_school_roster(body.get("revision", ""), body.get("acknowledged"))
                     except ValueError as exc:
                         return self.respond(409, {"error": str(exc)})
-                    return self.respond(200, result)
-                if self.path in {"/api/prepare-trial", "/api/trial-submit"}:
-                    try:
-                        result = prepare_school_trial(body) if self.path == "/api/prepare-trial" else submit_school_trial(body)
-                    except ValueError as exc:
-                        return self.respond(409, {"error": str(exc)})
-                    except RuntimeError as exc:
-                        return self.respond(503, {"error": str(exc)})
                     return self.respond(200, result)
                 if self.path in {"/api/prepare-batch", "/api/batch-submit"}:
                     try:

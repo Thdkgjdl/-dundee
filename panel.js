@@ -2,11 +2,11 @@ const $ = id => document.getElementById(id);
 const methods = ['电话', '当面', '室友转达'];
 let revision = '', schoolRevision = '', schoolReady = false, schoolVerified = false;
 let schoolRecords = [], draftRevision = '', drafts = new Map();
-let trialToken = '', batchToken = '', batchGeneration = 0, trialGeneration = 0;
-let previewPreparing = false, trialPreparing = false, schoolBusy = false;
+let batchToken = '', batchGeneration = 0;
+let previewPreparing = false, schoolBusy = false;
 let localSubmitting = false, serverRunning = false, statusBusy = false;
 let lastBatchStatus = '';
-let batchExpiry, trialExpiry;
+let batchExpiry;
 let gateOpen = true, gateBusy = false, gateTimer = null;
 const gateWaiting = {endpoint_unavailable: '尚未打开学校登录窗口，请点击上方按钮。', login_required: '学校页面已打开，等待登录…',
   loading: '学校页面加载中…', not_school_page: '当前不在学校业务页，请在独立 Edge 窗口中进入学校 H5。',
@@ -35,16 +35,12 @@ function updateControls() {
   $('schoolAck').disabled = busy || !schoolReady || !schoolRecords.length;
   $('verifySchool').disabled = busy || !schoolReady || !$('schoolAck').checked;
   $('applyBatch').disabled = busy || !schoolReady || !schoolRecords.length;
-  for (const id of ['batchMethod', 'batchNote', 'trialMethod', 'trialNote']) $(id).disabled = busy;
-  $('trialRecord').disabled = busy || !schoolReady;
+  for (const id of ['batchMethod', 'batchNote']) $(id).disabled = busy;
   document.querySelectorAll('.batch-method, .batch-note').forEach(input => input.disabled = busy);
   $('prepareBatch').disabled = busy || previewPreparing || !schoolReady || !schoolVerified || !schoolRecords.length;
-  $('prepareTrial').disabled = busy || trialPreparing || !schoolReady || !schoolVerified || !schoolRecords.length;
   $('batchAck').disabled = busy || !batchToken;
-  $('trialAck').disabled = busy || !trialToken;
   $('submitBatch').disabled = busy || !batchToken || !$('batchAck').checked;
   $('oneClickSubmit').disabled = busy || previewPreparing || !schoolReady || !schoolRecords.length || !$('schoolAck').checked;
-  $('submitTrial').disabled = busy || !trialToken || !$('trialAck').checked;
   $('readAllRoster').disabled = busy || allRosterBusy;
 }
 function clearBatch() {
@@ -53,14 +49,6 @@ function clearBatch() {
   batchToken = '';
   $('batchPreview').textContent = '';
   $('batchAck').checked = false;
-  updateControls();
-}
-function clearTrial() {
-  trialGeneration++;
-  clearTimeout(trialExpiry);
-  trialToken = '';
-  $('trialPreview').textContent = '';
-  $('trialAck').checked = false;
   updateControls();
 }
 function collectDrafts() {
@@ -111,12 +99,8 @@ function showSchool(page) {
   } else $('schoolRows').innerHTML = '';
   if (changed) {
     $('schoolAck').checked = false;
-    const selected = $('trialRecord').value;
-    $('trialRecord').innerHTML = ready ? '<option value="">请选择试验人员</option>' +
-      schoolRecords.map(record => '<option value="' + esc(record.id) + '">' + esc(record.name) + ' · ' + esc(record.id) + '</option>').join('') : '';
-    if (ready && schoolRecords.some(record => record.id === selected)) $('trialRecord').value = selected;
   }
-  if (changed || !schoolVerified) { clearBatch(); clearTrial(); }
+  if (changed || !schoolVerified) { clearBatch(); }
   updateControls();
 }
 function schoolError(error) {
@@ -194,7 +178,7 @@ async function readBatchStatus() {
     const signature = JSON.stringify(status);
     if (signature !== lastBatchStatus && (!localSubmitting || status.status !== 'idle')) showBatchResult(status);
     lastBatchStatus = signature;
-    if (serverRunning) { clearBatch(); clearTrial(); }
+    if (serverRunning) { clearBatch(); }
   } catch (error) { if (submitting()) $('batchResult').textContent = '无法读取执行进度；请保留页面并人工核对学校结果，不要重复提交。'; }
   finally { statusBusy = false; updateControls(); }
 }
@@ -231,7 +215,7 @@ $('submitBatch').onclick = async () => {
   if (submitting() || schoolBusy || !batchToken || !$('batchAck').checked) return;
   const token = batchToken;
   localSubmitting = true;
-  clearBatch(); clearTrial();
+  clearBatch();
   $('batchResult').textContent = '正在官方页面依次提交并逐条核对；请保留面板和独立 Edge。';
   try { showBatchResult(await api('/api/batch-submit', {token, supervised_approved: true})); }
   catch (error) { $('batchResult').textContent = error.message; }
@@ -248,7 +232,6 @@ $('oneClickSubmit').onclick = async () => {
   localSubmitting = true;
   updateControls();
   clearBatch();
-  clearTrial();
   $('batchResult').textContent = '一键代确认已开始：正在保存今日名单核验快照…';
   try {
     if (!schoolVerified) {
@@ -293,37 +276,6 @@ $('verifySchool').onclick = async () => {
 $('saveTime').onclick = async () => {
   try { await api('/api/settings', {time: $('runAt').value}); await load(); }
   catch (error) { alert(error.message); }
-};
-for (const id of ['trialRecord', 'trialMethod', 'trialNote']) $(id).oninput = clearTrial;
-$('prepareTrial').onclick = async () => {
-  if (submitting() || schoolBusy || trialPreparing || !schoolVerified) return;
-  clearTrial();
-  const generation = trialGeneration, expectedRevision = schoolRevision;
-  trialPreparing = true;
-  updateControls();
-  try {
-    const preview = await api('/api/prepare-trial', {revision: expectedRevision,
-      record_id: $('trialRecord').value, method: $('trialMethod').value, explanation: $('trialNote').value});
-    if (generation !== trialGeneration || expectedRevision !== schoolRevision || submitting() || !schoolVerified) return;
-    trialToken = preview.token;
-    $('trialPreview').textContent = preview.date + ' · ' + preview.record.name + ' · ' + preview.record.id +
-      '\n核实方式：' + preview.method + '\n说明：' + preview.explanation + '\n' + preview.notice;
-    trialExpiry = setTimeout(() => clearTrial(), 300000);
-  } catch (error) { if (generation === trialGeneration) $('trialResult').textContent = error.message; }
-  finally { trialPreparing = false; updateControls(); }
-};
-$('trialAck').onchange = updateControls;
-$('submitTrial').onclick = async () => {
-  if (submitting() || schoolBusy || !trialToken || !$('trialAck').checked) return;
-  const token = trialToken;
-  localSubmitting = true;
-  clearBatch(); clearTrial();
-  $('trialResult').textContent = '正在提交并核对这一条；请观察独立 Edge，不会自动重试。';
-  try {
-    const result = await api('/api/trial-submit', {token, supervised_approved: true});
-    $('trialResult').textContent = result.status + ' · ' + result.detail;
-  } catch (error) { $('trialResult').textContent = error.message; }
-  finally { localSubmitting = false; updateControls(); await readSchool(); await load(); readAllRoster(); }
 };
 $('ack').onchange = event => $('verify').disabled = !event.target.checked;
 $('verify').onclick = async () => {
